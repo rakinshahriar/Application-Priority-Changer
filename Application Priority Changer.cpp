@@ -43,24 +43,22 @@ WCHAR szWindowClass[MAX_LOADSTRING]; // the main window class name
 static int g_sortColumn =0; //0 = name,1 = pid,2 = priority
 static bool g_sortAscending = true;
 
-// store selected PID globally so refresh can restore selection
-static DWORD g_selectedPID =0; //0 means none
-
-// Refresh timer interval in milliseconds (default30000 =30s)
-static UINT g_refreshIntervalMs =30000;
-
-// Flag to indicate a full refresh is in progress
-static bool g_isFullRefreshing = false;
-
-// Timer IDs
-static const UINT_PTR TIMER_FULL_REFRESH =1;
-static const UINT_PTR TIMER_PRIORITY_UPDATE =2;
-
 struct ProcessEntry {
  DWORD pid;
  std::wstring name;
  DWORD priorityClass; // numeric priority class value,0 if unknown
 };
+
+// Global runtime state (selection, timers, refresh)
+static DWORD g_selectedPID = 0; // 0 means none
+ static UINT g_refreshIntervalMs = 30000; // default 30s
+ static bool g_isFullRefreshing = false;
+ static const UINT_PTR TIMER_FULL_REFRESH = 1;
+ static const UINT_PTR TIMER_PRIORITY_UPDATE = 2;
+
+// avoid conflicts with Windows min/max macros by using local helpers
+static inline int i_max(int a, int b) { return a > b ? a : b; }
+static inline int i_min(int a, int b) { return a < b ? a : b; }
 
 // Forward declarations
 ATOM MyRegisterClass(HINSTANCE hInstance);
@@ -74,6 +72,7 @@ static void ClearProcessEntries(HWND hListView);
 static int CALLBACK ListViewCompare(LPARAM lParam1, LPARAM lParam2, LPARAM lParamSort);
 static DWORD QueryProcessPriorityClass(DWORD pid);
 static const wchar_t* PriorityClassToName(DWORD pclass);
+static void AdjustListViewColumns(HWND hListView);
 
 static void ClearProcessEntries(HWND hListView)
 {
@@ -252,14 +251,16 @@ static void RefreshProcessList(HWND hListView, HWND hSearchEdit)
  ListView_SortItems(hListView, ListViewCompare,0);
 
  // restore top visible item by PID if we recorded one (robust across sorting/filtering)
- if (topPID !=0) {
+ if (topPID != 0) {
  int count = ListView_GetItemCount(hListView);
- for (int i =0; i < count; ++i) {
+ for (int i = 0; i < count; ++i) {
  LVITEMW lvi; ZeroMemory(&lvi, sizeof(lvi)); lvi.iItem = i; lvi.mask = LVIF_PARAM;
  if (ListView_GetItem(hListView, &lvi)) {
  ProcessEntry* p = (ProcessEntry*)lvi.lParam;
  if (p && p->pid == topPID) {
- SendMessageW(hListView, LVM_SETTOPINDEX, (WPARAM)i,0);
+ // Ensure the recorded item is visible after refresh. Using EnsureVisible
+ // avoids relying on LVM_SETTOPINDEX which may not be available in all headers.
+ ListView_EnsureVisible(hListView, i, FALSE);
  break;
  }
  }
@@ -267,9 +268,9 @@ static void RefreshProcessList(HWND hListView, HWND hSearchEdit)
  } else {
  // Fallback: clamp previous topIndex if it exists
  int itemCount = ListView_GetItemCount(hListView);
- if (itemCount >0 && topIndex >0) {
- if (topIndex >= itemCount) topIndex = itemCount -1;
- SendMessageW(hListView, LVM_SETTOPINDEX, (WPARAM)topIndex,0);
+ if (itemCount > 0 && topIndex > 0) {
+ if (topIndex >= itemCount) topIndex = itemCount - 1;
+ ListView_EnsureVisible(hListView, topIndex, FALSE);
  }
  }
 
@@ -402,6 +403,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
  col.cx =100; col.pszText = (LPWSTR)L"PID"; ListView_InsertColumn(hListProcs,1, &col);
  col.cx =140; col.pszText = (LPWSTR)L"Priority"; ListView_InsertColumn(hListProcs,2, &col);
 
+ // Initial proportional adjustment for columns
+ AdjustListViewColumns(hListProcs);
+
  CreateWindowW(L"BUTTON", L"Use Selected", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
 320,115,120,24, hWnd, (HMENU)ID_BUTTON_USE, hInst, NULL);
 
@@ -441,12 +445,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
  std::wstring pri = std::to_wstring(priorityNumeric);
  std::wstring params;
- if (g_selectedPID !=0) {
- params = L"-Command \"Get-WmiObject Win32_Process -Filter 'ProcessId = " + std::to_wstring(g_selectedPID) + L"' | ForEach-Object { $_.SetPriority(" + pri + L") }\"";
- } else {
  std::wstring proc(procName);
- params = L"-Command \"Get-WmiObject Win32_Process -Filter 'name = \\\"" + proc + L"\\\"' | ForEach-Object { $_.SetPriority(" + pri + L") }\"";
+ bool havePid = (g_selectedPID != 0);
+ bool haveName = (proc.size() > 0);
+
+ if (havePid && haveName) {
+ // Match by PID OR name (case-insensitive). Use a pipeline and Where-Object to combine conditions.
+ // Example: Get-WmiObject Win32_Process | Where-Object { $_.ProcessId -eq 1234 -or $_.Name -ieq 'proc.exe' } | ForEach-Object { $_.SetPriority(8) }
+ params = L"-Command \"Get-WmiObject Win32_Process | Where-Object { $_.ProcessId -eq " + std::to_wstring(g_selectedPID) + L" -or $_.Name -ieq \\\"" + proc + L"\\\" } | ForEach-Object { $_.SetPriority(" + pri + L") }\"";
  }
+ else if (havePid) {
+ params = L"-Command \"Get-WmiObject Win32_Process | Where-Object { $_.ProcessId -eq " + std::to_wstring(g_selectedPID) + L" } | ForEach-Object { $_.SetPriority(" + pri + L") }\"";
+ }
+ else if (haveName) {
+ params = L"-Command \"Get-WmiObject Win32_Process | Where-Object { $_.Name -ieq \\\"" + proc + L"\\\" } | ForEach-Object { $_.SetPriority(" + pri + L") }\"";
+ }
+ else {
+ MessageBoxW(hWnd, L"Please provide a process name or select from the list.", L"Input required", MB_OK | MB_ICONEXCLAMATION);
+ break;
+ }
+
  HINSTANCE result = ShellExecuteW(NULL, L"runas", L"powershell.exe", params.c_str(), NULL, SW_SHOWNORMAL);
  if ((INT_PTR)result <=32)
  MessageBoxW(hWnd, L"Failed to start PowerShell elevated.", L"Error", MB_OK | MB_ICONERROR);
@@ -545,6 +563,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
  }
  }
  break;
+ 
+ case WM_SIZE: {
+    // Reposition and resize controls so the listview expands/shrinks with the window.
+    int newW = LOWORD(lParam);
+    int newH = HIWORD(lParam);
+    // enforce minimum sizes
+    const int minW = 480;
+    const int minH = 240;
+    if (newW < minW) newW = minW;
+    if (newH < minH) newH = minH;
+
+    // Basic layout constants matching initial design
+    const int margin = 10;
+    const int controlHeight = 24;
+    const int listTop = 115;
+    const int bottomMargin = 20;
+
+    // Move a few top controls (they'll clamp if window too small)
+    HWND hEditProc = GetDlgItem(hWnd, ID_EDIT_PROC);
+    if (hEditProc) MoveWindow(hEditProc, margin, 30, i_max(120, i_min(300, newW - 2*margin)), controlHeight, TRUE);
+    HWND hComboPri = GetDlgItem(hWnd, ID_COMBO_PRI);
+    if (hComboPri) MoveWindow(hComboPri, 320, 30, 240, controlHeight, TRUE);
+    HWND hEditSearch = GetDlgItem(hWnd, ID_EDIT_SEARCH);
+    if (hEditSearch) MoveWindow(hEditSearch, margin, 85, i_max(120, i_min(300, newW - 2*margin)), controlHeight, TRUE);
+    HWND hEditInterval = GetDlgItem(hWnd, ID_EDIT_INTERVAL);
+    if (hEditInterval) MoveWindow(hEditInterval, 400, 85, 60, controlHeight, TRUE);
+
+    // Resize listview to fill available client area
+    HWND hList = GetDlgItem(hWnd, ID_LIST_PROCS);
+    if (hList) {
+      int listW = i_max(200, newW - 2*margin);
+      int listH = i_max(80, newH - listTop - bottomMargin);
+      MoveWindow(hList, margin, listTop, listW, listH, TRUE);
+      // Smoothly adjust all columns according to new size
+      AdjustListViewColumns(hList);
+     }
+  }
+  break;
 
  case WM_PAINT: {
  PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps); EndPaint(hWnd, &ps);
@@ -582,4 +638,34 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
  break;
  }
  return (INT_PTR)FALSE;
+}
+
+// Adjust listview column widths proportionally to the client width
+static void AdjustListViewColumns(HWND hListView)
+{
+    if (!hListView) return;
+    RECT rc; GetClientRect(hListView, &rc);
+    int totalW = rc.right - rc.left;
+    if (totalW <= 0) return;
+
+    // Reserve some space for scrollbar and padding
+    int scrollW = GetSystemMetrics(SM_CXVSCROLL) + 8;
+
+    // Proportions: Name ~60%, PID ~15%, Priority ~25% (of usable width)
+    int usable = totalW - scrollW;
+    if (usable < 200) usable = totalW; // fallback
+
+    int pidW = i_max(60, (int)(usable * 0.15));
+    int priW = i_max(80, (int)(usable * 0.20));
+    int nameW = usable - pidW - priW;
+    if (nameW < 100) {
+        // clamp and reflow
+        nameW = i_max(100, usable - pidW - priW);
+    }
+
+    LVCOLUMNW col; ZeroMemory(&col, sizeof(col));
+    col.mask = LVCF_WIDTH;
+    col.cx = nameW; ListView_SetColumn(hListView, 0, &col);
+    col.cx = pidW; ListView_SetColumn(hListView, 1, &col);
+    col.cx = priW; ListView_SetColumn(hListView, 2, &col);
 }
